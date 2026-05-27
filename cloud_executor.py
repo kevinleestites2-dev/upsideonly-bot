@@ -11,7 +11,7 @@ from datetime import datetime
 from playwright.sync_api import sync_playwright
 from signal_engine import analyze_snapshot
 
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "8679655550:AAGUB1m5fmqHc8OHqqM24Vixz8FfwX-gqD4")
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "8776802338:AAENyG3ADwNRpk59CuBDnsh8fDGcEuUFVSg")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "7135054241")
 COOKIES_FILE = "cookies.json"
 MIN_CONVICTION = 30
