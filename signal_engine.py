@@ -14,7 +14,7 @@ from datetime import datetime
 from markets import MARKETS, SNAPSHOT, TIER_1, TIER_2
 
 FINNHUB_KEY = "d86chq1r01qgiu44rds0d86chq1r01qgiu44rdsg"
-TELEGRAM_TOKEN = "8679655550:AAGUB1m5fmqHc8OHqqM24Vixz8FfwX-gqD4"
+TELEGRAM_TOKEN = "8776802338:AAENyG3ADwNRpk59CuBDnsh8fDGcEuUFVSg"
 TELEGRAM_CHAT_ID = "7135054241"
 
 # Signal thresholds
