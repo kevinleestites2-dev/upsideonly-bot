@@ -168,12 +168,27 @@ async def main():
 
         # Handle Google "Match the number" dp challenge
         if "challenge/dp" in page.url:
-            page_text = await page.evaluate("() => document.body.innerText")
-            import re
-            numbers = re.findall(r'\b\d{2}\b', page_text)
-            telegram(f"🔢 MATCH THE NUMBER — tap this on your phone:\n\n{page_text[:500]}\n\nNumbers found: {numbers}")
+            # Extract ONLY the big number shown on screen (not instructional text)
+            dp_number = await page.evaluate("""
+                () => {
+                    // Look for elements that contain ONLY a 1-2 digit number
+                    const all = document.querySelectorAll('*');
+                    for (const el of all) {
+                        const text = el.childNodes.length === 1 && el.firstChild.nodeType === 3
+                            ? el.firstChild.textContent.trim()
+                            : el.innerText ? el.innerText.trim() : '';
+                        if (/^\\d{1,3}$/.test(text) && parseInt(text) > 1) return text;
+                    }
+                    return null;
+                }
+            """)
+            # Fallback: screenshot + raw number extraction
             await snap(page, "dp_challenge")
-            telegram("⏳ Waiting 90s — tap the number on your phone now...")
+            if dp_number:
+                telegram(f"🔢 TAP THIS NUMBER ON YOUR PHONE:\n\n    ➡️  {dp_number}  ⬅️\n\nThen tap YES on the Google notification first.")
+            else:
+                telegram("🔢 Check the dp_challenge screenshot — tap the NUMBER shown on your phone screen.")
+            telegram("⏳ Waiting 90s — YES first, then the number!")
             await asyncio.sleep(90)
             await snap(page, "dp_after_wait")
 
