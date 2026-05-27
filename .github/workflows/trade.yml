@@ -2,8 +2,8 @@ name: UpsideOnly Bot — Trade Cycle
 
 on:
   schedule:
-    - cron: "*/30 * * * *"   # Every 30 minutes
-  workflow_dispatch:          # Manual trigger
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
 
 jobs:
   trade:
@@ -20,18 +20,11 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: |
-          pip install playwright requests pandas numpy yfinance
-          playwright install chromium
-          playwright install-deps chromium
-
-      - name: Write session cookies
-        env:
-          COOKIES_JSON: ${{ secrets.COOKIES_JSON }}
-        run: echo "$COOKIES_JSON" > cookies.json
+        run: pip install requests pandas numpy
 
       - name: Run trade cycle
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          UPSIDEONLY_TOKEN: ${{ secrets.UPSIDEONLY_TOKEN }}
         run: python cloud_executor.py
