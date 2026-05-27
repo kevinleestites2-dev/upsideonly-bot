@@ -1,5 +1,6 @@
-pandas
-numpy
-requests
-yfinance
+browser-use==0.1.40
 playwright
+langchain-groq
+python-dotenv
+requests
+aiohttp
