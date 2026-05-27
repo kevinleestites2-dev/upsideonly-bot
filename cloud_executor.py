@@ -1,13 +1,7 @@
 """
-UpsideOnly Bot — Cloud Executor v4
-IMPORTANT: UpsideOnly uses a DRAWING-BASED prediction system.
-Flow: Login → Navigate to asset → Draw on chart → Pick direction (Up/Down) → Submit
-
-Without a valid session cookie, all trade execution is blocked.
-This executor handles:
-1. Session validation
-2. API-based trade submission (if endpoint found)
-3. Graceful fallback with diagnostics when session is missing
+UpsideOnly Bot — Cloud Executor v5
+Auth: Bearer token from UPSIDEONLY_TOKEN env var (Auth0 access_token)
+Flow: signal → validate token → POST /api/v1/predictions → report
 """
 
 import json
@@ -19,15 +13,15 @@ from signal_engine import analyze_snapshot
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "8776802338:AAENyG3ADwNRpk59CuBDnsh8fDGcEuUFVSg")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "7135054241")
-COOKIES_FILE = "cookies.json"
+UPSIDEONLY_TOKEN = os.environ.get("UPSIDEONLY_TOKEN", "")
 MIN_CONVICTION = 30
 MAX_TRADES = 3
 BASE_URL = "https://upsideonly.com"
+API_BASE = "https://api.upsideonly.com"
 
-# Asset → market ID mapping (from /api/v1/markets)
-# SOL/USD first — that's Jimmie's arena
+# Asset → market UUID (from /api/v1/markets — confirmed live)
 ASSET_MARKET_IDS = {
-    "SOL/USD":  "da25c9b1-6ad6-4d8c-8f6b-8bca8eed3f89",  # primary SOL market
+    "SOL/USD":  "da25c9b1-6ad6-4d8c-8f6b-8bca8eed3f89",
     "BTC/USD":  "f8306ea5-05ac-45e6-8241-8414f4acc5bb",
     "ETH/USD":  "b5dd9349-c945-49ae-92ec-aff5d0cbe3b6",
     "QQQ":      "5bbb4472-8512-4cae-9f20-a02b11d70475",
@@ -43,24 +37,6 @@ ASSET_MARKET_IDS = {
     "BNB/USD":  "03051e83-a320-401c-a2d7-4e3bcae98328",
 }
 
-# Asset → trade URL (asset slug as used in UI)
-ASSET_URLS = {
-    "SOL/USD":  f"{BASE_URL}/trade/SOLUSD",
-    "BTC/USD":  f"{BASE_URL}/trade/BTCUSD",
-    "ETH/USD":  f"{BASE_URL}/trade/ETHUSD",
-    "QQQ":      f"{BASE_URL}/trade/QQQ",
-    "NVDA":     f"{BASE_URL}/trade/NVDA",
-    "TSLA":     f"{BASE_URL}/trade/TSLA",
-    "AAPL":     f"{BASE_URL}/trade/AAPL",
-    "META":     f"{BASE_URL}/trade/META",
-    "XAU/USD":  f"{BASE_URL}/trade/XAUUSD",
-    "XAG/USD":  f"{BASE_URL}/trade/XAGUSD",
-    "WTI/USD":  f"{BASE_URL}/trade/WTIUSD",
-    "EUR/USD":  f"{BASE_URL}/trade/EURUSD",
-    "GBP/USD":  f"{BASE_URL}/trade/GBPUSD",
-    "BNB/USD":  f"{BASE_URL}/trade/BNBUSD",
-}
-
 
 def send_telegram(msg):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -70,105 +46,126 @@ def send_telegram(msg):
         print(f"Telegram error: {e}")
 
 
-def load_cookies():
-    try:
-        with open(COOKIES_FILE) as f:
-            return json.load(f)
-    except Exception:
-        return []
-
-
-def cookies_to_header(cookies):
-    """Convert cookie list to Cookie header string."""
-    return "; ".join(f"{c['name']}={c['value']}" for c in cookies if "name" in c and "value" in c)
-
-
-def validate_session(cookies):
-    """Check if session is valid by hitting /api/v1/account."""
-    if not cookies:
+def get_auth_headers():
+    if not UPSIDEONLY_TOKEN:
         return None
-    headers = {
+    return {
+        "Authorization": f"Bearer {UPSIDEONLY_TOKEN}",
         "Accept": "application/json",
-        "Cookie": cookies_to_header(cookies),
+        "Content-Type": "application/json",
+        "Origin": BASE_URL,
+        "Referer": BASE_URL,
         "User-Agent": "Mozilla/5.0",
     }
-    try:
-        r = requests.get(f"{BASE_URL}/api/v1/account", headers=headers, timeout=10)
-        if r.status_code == 200:
-            d = r.json()
-            print(f"  Session valid — user: {d.get('username', 'unknown')} | balance: ${d.get('balance', 0):,.2f}")
-            return d
-    except Exception as e:
-        print(f"  Session check error: {e}")
+
+
+def validate_token():
+    headers = get_auth_headers()
+    if not headers:
+        return None
+    # Try both API bases — frontend uses upsideonly.com, backend may be api.upsideonly.com
+    for base in [BASE_URL, API_BASE]:
+        try:
+            r = requests.get(f"{base}/api/v1/account", headers=headers, timeout=10)
+            if r.status_code == 200:
+                d = r.json()
+                username = d.get("username") or d.get("display_name", "unknown")
+                balance = d.get("balance") or d.get("portfolio_balance", 0)
+                print(f"  Token valid [{base}] — user: {username} | balance: ${balance:,.2f}")
+                return d
+            elif r.status_code == 401:
+                print(f"  Token expired/invalid [{base}]: {r.text[:100]}")
+        except Exception as e:
+            print(f"  Validate error [{base}]: {e}")
     return None
 
 
-def submit_prediction_api(cookies, market_id, direction, amount=10):
-    """
-    Attempt to submit a prediction via the API directly.
-    direction: 'up' or 'down'
-    amount: USD amount (minimum $10)
-    """
-    headers = {
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "Cookie": cookies_to_header(cookies),
-        "User-Agent": "Mozilla/5.0",
-        "Referer": BASE_URL,
-        "Origin": BASE_URL,
-    }
+def submit_prediction(market_id, direction, amount=10):
+    """Submit via API. direction = 'up' or 'down'."""
+    headers = get_auth_headers()
+    if not headers:
+        return None
 
-    # Try /api/v1/predictions endpoint
     payload = {
         "market_id": market_id,
-        "direction": direction,  # 'up' or 'down'
+        "direction": direction,
         "amount": amount,
     }
 
-    try:
-        r = requests.post(f"{BASE_URL}/api/v1/predictions", headers=headers,
-                         json=payload, timeout=10)
-        print(f"  predictions POST: {r.status_code} | {r.text[:200]}")
-        if r.status_code in (200, 201):
-            return r.json()
-    except Exception as e:
-        print(f"  predictions POST error: {e}")
-
-    # Also try /api/v1/trades
-    try:
-        r2 = requests.post(f"{BASE_URL}/api/v1/trades", headers=headers,
-                          json=payload, timeout=10)
-        print(f"  trades POST: {r2.status_code} | {r2.text[:200]}")
-        if r2.status_code in (200, 201):
-            return r2.json()
-    except Exception as e:
-        print(f"  trades POST error: {e}")
+    for base in [BASE_URL, API_BASE]:
+        for endpoint in ["/api/v1/predictions", "/api/v1/trades", "/api/v1/order-fills"]:
+            try:
+                r = requests.post(f"{base}{endpoint}", headers=headers, json=payload, timeout=10)
+                print(f"  POST {base}{endpoint}: {r.status_code} | {r.text[:150]}")
+                if r.status_code in (200, 201):
+                    return r.json()
+                elif r.status_code == 422:
+                    # Unprocessable — log payload mismatch info
+                    print(f"  422 detail: {r.text[:300]}")
+            except Exception as e:
+                print(f"  POST error {endpoint}: {e}")
 
     return None
 
 
+def refresh_token():
+    """
+    Attempt to refresh using Auth0 refresh_token if stored.
+    Returns new access_token or None.
+    """
+    refresh = os.environ.get("UPSIDEONLY_REFRESH_TOKEN", "")
+    if not refresh:
+        return None
+
+    r = requests.post(
+        "https://auth.upsideonly.com/oauth/token",
+        json={
+            "grant_type": "refresh_token",
+            "client_id": "EH8iKT1Zurk62Xq3gYLD3fkvUm3LRRJH",
+            "refresh_token": refresh,
+        },
+        headers={"Content-Type": "application/json"},
+        timeout=10
+    )
+    if r.status_code == 200:
+        new_token = r.json().get("access_token")
+        print(f"  Token refreshed successfully")
+        return new_token
+    else:
+        print(f"  Token refresh failed: {r.status_code} | {r.text[:100]}")
+        return None
+
+
 def run_cycle(signals=None):
-    """
-    Main execution cycle.
-    1. Validate session
-    2. For each signal, attempt API trade submission
-    3. Report results
-    """
     now = datetime.now().strftime("%Y-%m-%d %H:%M EDT")
     print(f"\n[{now}] Starting execution cycle...")
 
-    cookies = load_cookies()
-    account = validate_session(cookies)
+    # Check token
+    global UPSIDEONLY_TOKEN
+    account = validate_token()
 
     if not account:
-        msg = (f"🔐 <b>UpsideOnly Bot — No Active Session</b>\n"
-               f"📅 {now}\n\n"
-               f"Trade execution requires a logged-in session.\n"
-               f"<b>Action needed:</b> Log into UpsideOnly on your phone, export cookies to <code>cookies.json</code>, "
-               f"and push to the repo as a GitHub Secret <code>COOKIES_JSON</code>.\n\n"
-               f"Monitoring continues ✅ — execution paused 🔐")
-        send_telegram(msg)
-        print("  No valid session. Execution paused.")
+        # Try refresh
+        new_token = refresh_token()
+        if new_token:
+            UPSIDEONLY_TOKEN = new_token
+            account = validate_token()
+
+    if not account:
+        send_telegram(
+            f"<b>UpsideOnly Bot — Session Required</b>\n"
+            f"<b>How to get your token (30 seconds):</b>\n\n"
+            f"1. Open Chrome on phone\n"
+            f"2. Go to upsideonly.com — log in with Google\n"
+            f"3. Open DevTools (or use HTTP Toolkit)\n"
+            f"4. Any API request will show: <code>Authorization: Bearer eyJ...</code>\n"
+            f"5. Copy that token\n"
+            f"6. Go to: github.com/kevinleestites2-dev/upsideonly-bot/settings/secrets/actions\n"
+            f"7. Add secret: <code>UPSIDEONLY_TOKEN</code> = the token\n\n"
+            f"Token lasts ~4 hours. Refresh token setup = auto-renewal.\n"
+            f"Monitoring still running. Execution paused."
+        )
+        print("  No valid token. Execution paused.")
         return 0
 
     if signals is None:
@@ -183,39 +180,36 @@ def run_cycle(signals=None):
 
     for signal in signals[:MAX_TRADES]:
         sym = signal["symbol"]
-        direction = signal["direction"].lower()  # 'buy' → 'up', 'sell' → 'down'
-        api_direction = "up" if direction == "buy" else "down"
+        direction = "up" if signal["direction"].upper() == "BUY" else "down"
         market_id = ASSET_MARKET_IDS.get(sym)
         conviction = signal["conviction"]
 
         if conviction < MIN_CONVICTION:
             continue
-
         if not market_id:
-            print(f"  {sym}: No market ID mapped — skipping")
+            print(f"  {sym}: no market ID — skip")
             continue
 
-        print(f"  Executing: {api_direction.upper()} {sym} | conviction={conviction}%")
-
-        result = submit_prediction_api(cookies, market_id, api_direction, amount=10)
+        print(f"  {direction.upper()} {sym} | conviction={conviction}% | market={market_id[:8]}...")
+        result = submit_prediction(market_id, direction, amount=10)
 
         if result and result.get("success") is not False:
             executed += 1
-            results.append(f"✅ {api_direction.upper()} {sym} @ {signal['price']} | {conviction}%")
+            results.append(f"<b>{direction.upper()} {sym}</b> @ ${signal['price']:,} — {conviction}% conviction")
         else:
-            results.append(f"⚠️ FAILED {api_direction.upper()} {sym} — {str(result)[:60] if result else 'no response'}")
+            err = str(result)[:80] if result else "no response"
+            results.append(f"FAILED {direction.upper()} {sym} — {err}")
 
         time.sleep(1.5)
 
     summary = "\n".join(results) if results else "No trades attempted"
     send_telegram(
-        f"⚡ <b>UpsideOnly Bot — Cycle Complete</b>\n"
-        f"📅 {now}\n"
-        f"{executed} trades executed\n\n"
+        f"<b>UpsideOnly — Cycle {now}</b>\n"
+        f"{executed}/{len(signals[:MAX_TRADES])} trades executed\n\n"
         f"{summary}"
     )
 
-    print(f"\n[EXECUTOR] {executed} trades executed.")
+    print(f"\n[EXECUTOR] {executed} trades fired.")
     return executed
 
 
@@ -224,5 +218,5 @@ if __name__ == "__main__":
     signals = analyze_snapshot()
     print(f"Signals: {len(signals)}")
     for s in signals[:5]:
-        print(f"  {s['direction']} {s['symbol']} | conviction={s['conviction']}% | {s['reason']}")
+        print(f"  {s['direction']} {s['symbol']} | {s['conviction']}% | {s['reason']}")
     run_cycle(signals)
