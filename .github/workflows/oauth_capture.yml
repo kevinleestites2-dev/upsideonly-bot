@@ -1,0 +1,31 @@
+name: OAuth Token Capture
+
+on:
+  workflow_dispatch:
+
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install deps
+        run: pip install requests
+
+      - name: Start OAuth callback server
+        env:
+          NGROK_AUTH: 3COktG8XJfk1jHyLko0mUnx4pXx_2KxahkrrCr5Je3ja6chZd
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          # Install ngrok
+          curl -sL https://ngrok-agent.s3.amazonaws.com/ngrok.asc | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
+          echo "deb https://ngrok-agent.s3.amazonaws.com buster main" | sudo tee /etc/apt/sources.list.d/ngrok.list
+          sudo apt-get update -q && sudo apt-get install -q -y ngrok
+          ngrok config add-authtoken $NGROK_AUTH
+          python3 oauth_server.py
