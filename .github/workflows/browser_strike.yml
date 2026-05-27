@@ -3,7 +3,7 @@ name: UpsideOnly Browser Strike
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 */6 * * *'  # Every 6 hours
+    - cron: '0 */6 * * *'
 
 jobs:
   strike:
@@ -21,12 +21,10 @@ jobs:
       - name: Install dependencies
         run: |
           pip install -r requirements.txt
-          playwright install chromium
-          playwright install-deps chromium
+          python -m camoufox fetch
 
-      - name: Run Browser Agent
+      - name: Run Ghost Agent
         env:
-          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           GOOGLE_EMAIL: ${{ secrets.GOOGLE_EMAIL }}
