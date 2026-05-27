@@ -1,6 +1,13 @@
 """
-UpsideOnly Bot — Cloud Executor v3
-DOM-aware trade execution via Playwright on GitHub Actions.
+UpsideOnly Bot — Cloud Executor v4
+IMPORTANT: UpsideOnly uses a DRAWING-BASED prediction system.
+Flow: Login → Navigate to asset → Draw on chart → Pick direction (Up/Down) → Submit
+
+Without a valid session cookie, all trade execution is blocked.
+This executor handles:
+1. Session validation
+2. API-based trade submission (if endpoint found)
+3. Graceful fallback with diagnostics when session is missing
 """
 
 import json
@@ -8,7 +15,6 @@ import os
 import time
 import requests
 from datetime import datetime
-from playwright.sync_api import sync_playwright
 from signal_engine import analyze_snapshot
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "8776802338:AAENyG3ADwNRpk59CuBDnsh8fDGcEuUFVSg")
@@ -16,23 +22,43 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "7135054241")
 COOKIES_FILE = "cookies.json"
 MIN_CONVICTION = 30
 MAX_TRADES = 3
+BASE_URL = "https://upsideonly.com"
 
-SYMBOL_URLS = {
-    "WTI/USD":  "https://upsideonly.com/trade/WTI",
-    "XAG/USD":  "https://upsideonly.com/trade/XAGUSD",
-    "XAU/USD":  "https://upsideonly.com/trade/XAUUSD",
-    "NVDA":     "https://upsideonly.com/trade/NVDA",
-    "TSLA":     "https://upsideonly.com/trade/TSLA",
-    "AAPL":     "https://upsideonly.com/trade/AAPL",
-    "AMZN":     "https://upsideonly.com/trade/AMZN",
-    "META":     "https://upsideonly.com/trade/META",
-    "SPY":      "https://upsideonly.com/trade/SPY",
-    "QQQ":      "https://upsideonly.com/trade/QQQ",
-    "BTC/USD":  "https://upsideonly.com/trade/BTCUSD",
-    "ETH/USD":  "https://upsideonly.com/trade/ETHUSD",
-    "SOL/USD":  "https://upsideonly.com/trade/SOLUSD",
-    "EUR/USD":  "https://upsideonly.com/trade/EURUSD",
-    "GBP/USD":  "https://upsideonly.com/trade/GBPUSD",
+# Asset → market ID mapping (from /api/v1/markets)
+# SOL/USD first — that's Jimmie's arena
+ASSET_MARKET_IDS = {
+    "SOL/USD":  "da25c9b1-6ad6-4d8c-8f6b-8bca8eed3f89",  # primary SOL market
+    "BTC/USD":  "f8306ea5-05ac-45e6-8241-8414f4acc5bb",
+    "ETH/USD":  "b5dd9349-c945-49ae-92ec-aff5d0cbe3b6",
+    "QQQ":      "5bbb4472-8512-4cae-9f20-a02b11d70475",
+    "NVDA":     "a9e20906-3fde-4191-91fb-7216246e8f42",
+    "TSLA":     "77171ec9-0eee-45c2-8bc7-d325c7769f4f",
+    "AAPL":     "00a37d38-e3fa-4281-aaa6-19eb5938b313",
+    "META":     "2d85f9e0-31f3-4364-b04d-4d2283adcc53",
+    "XAU/USD":  "fe582cbd-7b8d-450d-bdff-55b06eb5b15e",
+    "XAG/USD":  "d78964a1-74cf-4553-9338-e75c02d4b6cb",
+    "WTI/USD":  "9b3e004d-dc0e-40f6-83a7-40f2241ce577",
+    "EUR/USD":  "e3af4b59-616c-48a4-a3d5-e56d78a9489d",
+    "GBP/USD":  "1e971306-028e-4298-8521-129ecdaa662e",
+    "BNB/USD":  "03051e83-a320-401c-a2d7-4e3bcae98328",
+}
+
+# Asset → trade URL (asset slug as used in UI)
+ASSET_URLS = {
+    "SOL/USD":  f"{BASE_URL}/trade/SOLUSD",
+    "BTC/USD":  f"{BASE_URL}/trade/BTCUSD",
+    "ETH/USD":  f"{BASE_URL}/trade/ETHUSD",
+    "QQQ":      f"{BASE_URL}/trade/QQQ",
+    "NVDA":     f"{BASE_URL}/trade/NVDA",
+    "TSLA":     f"{BASE_URL}/trade/TSLA",
+    "AAPL":     f"{BASE_URL}/trade/AAPL",
+    "META":     f"{BASE_URL}/trade/META",
+    "XAU/USD":  f"{BASE_URL}/trade/XAUUSD",
+    "XAG/USD":  f"{BASE_URL}/trade/XAGUSD",
+    "WTI/USD":  f"{BASE_URL}/trade/WTIUSD",
+    "EUR/USD":  f"{BASE_URL}/trade/EURUSD",
+    "GBP/USD":  f"{BASE_URL}/trade/GBPUSD",
+    "BNB/USD":  f"{BASE_URL}/trade/BNBUSD",
 }
 
 
@@ -44,177 +70,159 @@ def send_telegram(msg):
         print(f"Telegram error: {e}")
 
 
-def send_telegram_photo(img_path, caption=""):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
-    try:
-        with open(img_path, "rb") as f:
-            requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "caption": caption},
-                         files={"photo": f}, timeout=10)
-    except Exception as e:
-        print(f"Telegram photo error: {e}")
-
-
 def load_cookies():
     try:
         with open(COOKIES_FILE) as f:
             return json.load(f)
-    except Exception as e:
-        print(f"Cookie load error: {e}")
+    except Exception:
         return []
 
 
-def dump_page_info(page, label="page"):
-    screenshot_path = f"screenshot_{label}.png"
-    page.screenshot(path=screenshot_path, full_page=True)
-    print(f"  [DEBUG] Screenshot: {screenshot_path}")
-    buttons = page.query_selector_all("button")
-    print(f"  [DEBUG] Buttons found ({len(buttons)}):")
-    for b in buttons[:20]:
-        txt = b.inner_text().strip()
-        cls = b.get_attribute("class") or ""
-        if txt:
-            print(f"    btn: '{txt}' | class: {cls[:80]}")
-    return screenshot_path
+def cookies_to_header(cookies):
+    """Convert cookie list to Cookie header string."""
+    return "; ".join(f"{c['name']}={c['value']}" for c in cookies if "name" in c and "value" in c)
 
 
-def try_click_trade_button(page, direction):
-    btn_text = "Buy" if direction == "BUY" else "Sell"
-    alt_text = "Long" if direction == "BUY" else "Short"
-
-    selectors = [
-        f"button:has-text('{btn_text}')",
-        f"button:has-text('{alt_text}')",
-        f"[data-testid='{btn_text.lower()}']",
-        f"[data-testid='{alt_text.lower()}']",
-        f"[class*='{btn_text.lower()}']",
-        f"[class*='{alt_text.lower()}']",
-    ]
-
-    for sel in selectors:
-        try:
-            el = page.locator(sel).first
-            if el.count() > 0 and el.is_visible():
-                el.click()
-                print(f"  Clicked: {sel}")
-                return True
-        except Exception:
-            continue
-
-    # Fallback — scan all buttons
-    for b in page.query_selector_all("button"):
-        txt = b.inner_text().strip().lower()
-        if btn_text.lower() in txt or alt_text.lower() in txt:
-            try:
-                b.click()
-                print(f"  Clicked button text: {txt}")
-                return True
-            except Exception:
-                continue
-
-    return False
+def validate_session(cookies):
+    """Check if session is valid by hitting /api/v1/account."""
+    if not cookies:
+        return None
+    headers = {
+        "Accept": "application/json",
+        "Cookie": cookies_to_header(cookies),
+        "User-Agent": "Mozilla/5.0",
+    }
+    try:
+        r = requests.get(f"{BASE_URL}/api/v1/account", headers=headers, timeout=10)
+        if r.status_code == 200:
+            d = r.json()
+            print(f"  Session valid — user: {d.get('username', 'unknown')} | balance: ${d.get('balance', 0):,.2f}")
+            return d
+    except Exception as e:
+        print(f"  Session check error: {e}")
+    return None
 
 
-def try_confirm(page):
-    for txt in ["Confirm", "Place Order", "Submit", "Execute", "Place Trade"]:
-        try:
-            btn = page.locator(f"button:has-text('{txt}')").first
-            if btn.count() > 0 and btn.is_visible():
-                btn.click()
-                print(f"  Confirmed: {txt}")
-                return True
-        except Exception:
-            continue
-    return False
+def submit_prediction_api(cookies, market_id, direction, amount=10):
+    """
+    Attempt to submit a prediction via the API directly.
+    direction: 'up' or 'down'
+    amount: USD amount (minimum $10)
+    """
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Cookie": cookies_to_header(cookies),
+        "User-Agent": "Mozilla/5.0",
+        "Referer": BASE_URL,
+        "Origin": BASE_URL,
+    }
+
+    # Try /api/v1/predictions endpoint
+    payload = {
+        "market_id": market_id,
+        "direction": direction,  # 'up' or 'down'
+        "amount": amount,
+    }
+
+    try:
+        r = requests.post(f"{BASE_URL}/api/v1/predictions", headers=headers,
+                         json=payload, timeout=10)
+        print(f"  predictions POST: {r.status_code} | {r.text[:200]}")
+        if r.status_code in (200, 201):
+            return r.json()
+    except Exception as e:
+        print(f"  predictions POST error: {e}")
+
+    # Also try /api/v1/trades
+    try:
+        r2 = requests.post(f"{BASE_URL}/api/v1/trades", headers=headers,
+                          json=payload, timeout=10)
+        print(f"  trades POST: {r2.status_code} | {r2.text[:200]}")
+        if r2.status_code in (200, 201):
+            return r2.json()
+    except Exception as e:
+        print(f"  trades POST error: {e}")
+
+    return None
 
 
-def execute_trades(signals):
-    if not signals:
-        print("No signals.")
-        return
+def run_cycle(signals=None):
+    """
+    Main execution cycle.
+    1. Validate session
+    2. For each signal, attempt API trade submission
+    3. Report results
+    """
+    now = datetime.now().strftime("%Y-%m-%d %H:%M EDT")
+    print(f"\n[{now}] Starting execution cycle...")
 
     cookies = load_cookies()
-    if not cookies:
-        send_telegram("No cookies found — re-capture needed.")
-        return
+    account = validate_session(cookies)
 
-    tradeable = [s for s in signals if s["conviction"] >= MIN_CONVICTION][:MAX_TRADES]
-    if not tradeable:
-        print("No signals above threshold.")
-        return
+    if not account:
+        msg = (f"🔐 <b>UpsideOnly Bot — No Active Session</b>\n"
+               f"📅 {now}\n\n"
+               f"Trade execution requires a logged-in session.\n"
+               f"<b>Action needed:</b> Log into UpsideOnly on your phone, export cookies to <code>cookies.json</code>, "
+               f"and push to the repo as a GitHub Secret <code>COOKIES_JSON</code>.\n\n"
+               f"Monitoring continues ✅ — execution paused 🔐")
+        send_telegram(msg)
+        print("  No valid session. Execution paused.")
+        return 0
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage"]
-        )
-        context = browser.new_context(
-            viewport={"width": 1280, "height": 900},
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-        )
-        context.add_cookies(cookies)
-        page = context.new_page()
+    if signals is None:
+        signals = analyze_snapshot()
 
-        # Auth check
-        page.goto("https://upsideonly.com/portfolio", wait_until="domcontentloaded", timeout=20000)
-        page.wait_for_timeout(3000)
-        current_url = page.url
-        print(f"Auth URL: {current_url}")
+    if not signals:
+        print("  No signals above threshold.")
+        return 0
 
-        if "login" in current_url or "auth" in current_url or "signin" in current_url:
-            sc = dump_page_info(page, "auth_fail")
-            send_telegram_photo(sc, "Auth failed — cookies expired")
-            browser.close()
-            return
+    executed = 0
+    results = []
 
-        print("Auth OK")
+    for signal in signals[:MAX_TRADES]:
+        sym = signal["symbol"]
+        direction = signal["direction"].lower()  # 'buy' → 'up', 'sell' → 'down'
+        api_direction = "up" if direction == "buy" else "down"
+        market_id = ASSET_MARKET_IDS.get(sym)
+        conviction = signal["conviction"]
 
-        # Scout: screenshot first trade page so we see real DOM
-        first = tradeable[0]
-        scout_url = SYMBOL_URLS.get(first["symbol"], f"https://upsideonly.com/trade/{first['symbol']}")
-        page.goto(scout_url, wait_until="networkidle", timeout=20000)
-        page.wait_for_timeout(4000)
-        sc = dump_page_info(page, f"scout")
-        send_telegram_photo(sc, f"Scout: {first['symbol']} trade page")
+        if conviction < MIN_CONVICTION:
+            continue
 
-        executed = []
+        if not market_id:
+            print(f"  {sym}: No market ID mapped — skipping")
+            continue
 
-        for signal in tradeable:
-            sym = signal["symbol"]
-            direction = signal["direction"]
-            print(f"\n{direction} {sym} | {signal['conviction']}%")
+        print(f"  Executing: {api_direction.upper()} {sym} | conviction={conviction}%")
 
-            try:
-                url = SYMBOL_URLS.get(sym, f"https://upsideonly.com/trade/{sym}")
-                page.goto(url, wait_until="networkidle", timeout=20000)
-                page.wait_for_timeout(3000)
+        result = submit_prediction_api(cookies, market_id, api_direction, amount=10)
 
-                clicked = try_click_trade_button(page, direction)
-                if clicked:
-                    page.wait_for_timeout(1500)
-                    try_confirm(page)
-                    executed.append(signal)
-                else:
-                    sc = dump_page_info(page, f"fail_{sym.replace('/', '')}")
-                    send_telegram_photo(sc, f"Button not found: {sym} {direction}")
+        if result and result.get("success") is not False:
+            executed += 1
+            results.append(f"✅ {api_direction.upper()} {sym} @ {signal['price']} | {conviction}%")
+        else:
+            results.append(f"⚠️ FAILED {api_direction.upper()} {sym} — {str(result)[:60] if result else 'no response'}")
 
-            except Exception as e:
-                print(f"Error {sym}: {e}")
+        time.sleep(1.5)
 
-        browser.close()
+    summary = "\n".join(results) if results else "No trades attempted"
+    send_telegram(
+        f"⚡ <b>UpsideOnly Bot — Cycle Complete</b>\n"
+        f"📅 {now}\n"
+        f"{executed} trades executed\n\n"
+        f"{summary}"
+    )
 
-    if executed:
-        lines = [f"<b>UpsideOnly Bot — {len(executed)} Trade(s) Fired</b>",
-                 f"{datetime.now().strftime('%H:%M EDT')}\n"]
-        for s in executed:
-            arrow = "BUY" if s["direction"] == "BUY" else "SELL"
-            lines.append(f"{arrow} {s['symbol']} | {s['change_pct']:+.2f}% | {s['conviction']}%")
-        send_telegram("\n".join(lines))
-    else:
-        send_telegram("0 trades executed this cycle.")
+    print(f"\n[EXECUTOR] {executed} trades executed.")
+    return executed
 
 
 if __name__ == "__main__":
-    print(f"Cloud Executor v3 — {datetime.now().strftime('%Y-%m-%d %H:%M UTC')}")
+    from signal_engine import analyze_snapshot
     signals = analyze_snapshot()
     print(f"Signals: {len(signals)}")
-    execute_trades(signals)
+    for s in signals[:5]:
+        print(f"  {s['direction']} {s['symbol']} | conviction={s['conviction']}% | {s['reason']}")
+    run_cycle(signals)
