@@ -177,8 +177,35 @@ async def main():
             await asyncio.sleep(90)
             await snap(page, "dp_after_wait")
 
-        # Final localStorage check
+        # Navigate back to UpsideOnly after Google auth completes
+        await page.goto("https://upsideonly.com", wait_until="networkidle", timeout=30000)
+        await asyncio.sleep(5)
+        await snap(page, "06_back_on_upsideonly")
+
+        # Dump ALL localStorage keys + values
+        storage_dump = await page.evaluate("""
+            () => {
+                const result = {};
+                for (const key of Object.keys(localStorage)) {
+                    result[key] = localStorage.getItem(key);
+                }
+                return result;
+            }
+        """)
+        telegram(f"💾 localStorage ({len(storage_dump)} keys):\n" + "\n".join([f"  {k}: {str(v)[:80]}" for k, v in storage_dump.items()]))
+
+        # Dump cookies too
+        cookies = await context.cookies()
+        jwt_cookies = [c for c in cookies if len(c.get('value','')) > 50]
+        if jwt_cookies:
+            telegram(f"🍪 JWT Cookies:\n" + "\n".join([f"  {c['name']}: {c['value'][:80]}" for c in jwt_cookies[:5]]))
+
+        # Make an authenticated API call to trigger Bearer token in network
+        await page.goto("https://upsideonly.com/leaderboard", wait_until="networkidle", timeout=20000)
         await asyncio.sleep(4)
+        await snap(page, "07_leaderboard")
+
+        # Search localStorage again on leaderboard page
         final_token = await page.evaluate("""
             () => {
                 const keys = Object.keys(localStorage);
@@ -187,6 +214,7 @@ async def main():
                         const val = JSON.parse(localStorage.getItem(key));
                         if (val && val.body && val.body.access_token) return val.body.access_token;
                         if (val && val.access_token) return val.access_token;
+                        if (val && val.id_token) return val.id_token;
                     } catch(e) {}
                     const raw = localStorage.getItem(key);
                     if (raw && raw.startsWith('eyJ')) return raw;
