@@ -108,7 +108,7 @@ class CallbackHandler(BaseHTTPRequestHandler):
                     captured["refresh_token"] = refresh_token
                     self.send_response(200)
                     self.end_headers()
-                    self.wfile.write(b"<html><body style='background:#0a0a0a;color:#00ff88;font-family:monospace;padding:2rem'><h2>SUCCESS — Token Captured</h2><p>Bot is now active. Close this tab.</p></body></html>")
+                    self.wfile.write("<html><body style='background:#0a0a0a;color:#00ff88;font-family:monospace;padding:2rem'><h2>SUCCESS - Token Captured</h2><p>Bot is now active. Close this tab.</p></body></html>".encode("utf-8"))
                 else:
                     self.send_response(200)
                     self.end_headers()
