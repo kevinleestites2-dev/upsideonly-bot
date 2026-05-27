@@ -147,7 +147,7 @@ def run_cycle(signals):
     for signal in signals:
         if executed >= max_trades:
             break
-        if signal["conviction"] >= 70:  # Only fire high-conviction trades
+        if signal["conviction"] >= 30:  # Threshold — raise to 70 once live prices flowing
             success = execute_trade(signal)
             if success:
                 executed += 1
