@@ -129,6 +129,19 @@ async def main():
             )
             await page.goto(auth_url, wait_until="networkidle", timeout=20000)
 
+        # Wait for navigation to Google — may open new tab or redirect
+        try:
+            await page.wait_for_load_state("domcontentloaded", timeout=15000)
+        except:
+            pass
+
+        # If Google opened a new tab, switch to it
+        pages = page.context.pages
+        if len(pages) > 1:
+            page = pages[-1]
+            await page.wait_for_load_state("domcontentloaded", timeout=10000)
+            telegram(f"📑 Switched to new tab: {page.url[:80]}")
+
         await asyncio.sleep(3)
         await snap(page, "03_google_page")
 
