@@ -166,6 +166,17 @@ async def main():
             await snap(page, "error_state")
             telegram(f"⚠️ Login error: {e}")
 
+        # Handle Google "Match the number" dp challenge
+        if "challenge/dp" in page.url:
+            page_text = await page.evaluate("() => document.body.innerText")
+            import re
+            numbers = re.findall(r'\b\d{2}\b', page_text)
+            telegram(f"🔢 MATCH THE NUMBER — tap this on your phone:\n\n{page_text[:500]}\n\nNumbers found: {numbers}")
+            await snap(page, "dp_challenge")
+            telegram("⏳ Waiting 90s — tap the number on your phone now...")
+            await asyncio.sleep(90)
+            await snap(page, "dp_after_wait")
+
         # Final localStorage check
         await asyncio.sleep(4)
         final_token = await page.evaluate("""
