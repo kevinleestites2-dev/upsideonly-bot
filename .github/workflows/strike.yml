@@ -1,0 +1,27 @@
+name: UpsideOnly Strike Bot
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '*/30 * * * *'  # every 30 min as heartbeat restart
+
+jobs:
+  strike:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: pip install requests
+
+      - name: Run Strike Bot
+        run: python3 upsideonly_bot.py
+        env:
+          PYTHONUNBUFFERED: "1"
