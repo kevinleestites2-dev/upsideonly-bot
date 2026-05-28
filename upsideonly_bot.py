@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """
-UpsideOnly Strike Bot — Leaderboard Domination Engine
-Target: Knock JimmieShortsWorld off #1
-Loop: Open → Monitor → Close at target → Redeploy
-Token expiry alert built in.
+UpsideOnly Strike Bot v2.0 — Leaderboard Domination Engine
+Fixes:
+- Live prices via Finnhub + CoinGecko (no more stale snapshot)
+- Cooldown per symbol after a cut (15 min)
+- Focus only on high-volatility assets (crypto + vol_tier 1 stocks/commodities)
+- Improved TP/SL ratio: +0.5% TP / -0.25% SL (2:1 R/R)
+- Skip flat assets (<0.15% move) — no dead positions
+- Redeploy freed capital immediately after a win or cut
 """
 
 import requests
@@ -14,184 +18,339 @@ from datetime import datetime, timezone
 
 SESSION_TOKEN = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6IkRjbUUyTkpCWFNyZ2U0RVJGcVcxYyJ9.eyJpc3MiOiJodHRwczovL2F1dGgudXBzaWRlb25seS5jb20vIiwic3ViIjoiZ29vZ2xlLW9hdXRoMnwxMTQ1MjgzNDcxMDA3NzE1NzQzOTgiLCJhdWQiOlsiaHR0cHM6Ly9hcGkudXBzaWRlb25seS5jb20iLCJodHRwczovL2Rldi03b2IyMWJzbHR3enp4am00LnVzLmF1dGgwLmNvbS91c2VyaW5mbyJdLCJpYXQiOjE3Nzk5MjY0MzEsImV4cCI6MTc4MDAxMjgzMSwic2NvcGUiOiJvcGVuaWQgcHJvZmlsZSBlbWFpbCBvZmZsaW5lX2FjY2VzcyIsImF6cCI6IkVIOGlLVDFadXJrNjJYcTNnWUxEM2ZrdlVtM0xSUkpIIn0.hPqZm-FyssR5S41Xk2efOm_MFbS_c8wfhdkHgEW1Usk97wJIV3Mx4KU11CXsC5rgxuk_9ei5OpB8weV8Ys20x_zfuE-7BcKHHes26sW54FHgYqx1Yvu_NHesmCPLvhMuV2j6sPNA3L0SY6ltQftonL25w1F_IU0LFtgPaFbdRIyJw3Yn_ct6Smr5j1CGs2m3cwtPhIrwBfrEmGA-y14Qbwkaz-Ii6UrllwnuAvwcIf1pKQG4-yJkZetTJFommTrWqo2d_h406eoJibSK1t0x4blzgexsLlN0Zxz-tgEy5F9JxRmhAFnQwCMOr084PbBNf88BZtjlgR-ahvFgMtePuA"
 
-TOKEN_EXP_UTC   = 1780012831   # Unix timestamp — alert 2h before this
+TOKEN_EXP_UTC   = 1780012831
 
 TELEGRAM_TOKEN  = "8776802338:AAENyG3ADwNRpk59CuBDnsh8fDGcEuUFVSg"
 TELEGRAM_CHAT   = "7135054241"
 BASE_URL        = "https://upsideonly.com"
+FINNHUB_KEY     = "d86chq1r01qgiu44rds0d86chq1r01qgiu44rdsg"
 
-TAKE_PROFIT_PCT = 0.5     # close position at +0.5% gain
-STOP_LOSS_PCT   = -0.3    # cut at -0.3% loss
-TRADE_AMOUNT    = 10000   # USD per position
-MONITOR_SECS    = 30      # seconds between scan cycles
-REPORT_EVERY    = 10      # cycles between Telegram status reports
-TOKEN_WARN_SECS = 7200    # alert 2 hours before expiry
+# ─── STRATEGY PARAMS ──────────────────────────────────────────────────────────
+TAKE_PROFIT_PCT  = 0.5    # +0.5% TP
+STOP_LOSS_PCT    = -0.25  # -0.25% SL  -> 2:1 R/R
+TRADE_AMOUNT     = 10000  # USD per position
+MONITOR_SECS     = 30
+REPORT_EVERY     = 10
+TOKEN_WARN_SECS  = 7200
+COOLDOWN_SECS    = 900    # 15 min cooldown after a cut
+MIN_MOVE_PCT     = 0.15   # skip asset if 24h change is below this
 
+# Only trade these — high volatility, actually move
 STRIKE_SYMBOLS = [
-    "NVDA", "META", "TSLA", "SPY", "QQQ",
-    "AMZN", "AAPL", "BTC/USD", "SOL/USD", "XRP/USD"
+    "BTC/USD", "ETH/USD", "SOL/USD", "XRP/USD", "BNB/USD",
+    "NVDA", "TSLA",
+    "XAU/USD", "XAG/USD", "WTI/USD",
 ]
 
-# ─── API ──────────────────────────────────────────────────────────────────────
+# CoinGecko IDs for crypto
+COINGECKO_MAP = {
+    "BTC/USD": "bitcoin",
+    "ETH/USD": "ethereum",
+    "SOL/USD": "solana",
+    "XRP/USD": "ripple",
+    "BNB/USD": "binancecoin",
+}
 
-def headers():
-    return {
-        "Authorization": f"Bearer {SESSION_TOKEN}",
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "Origin": BASE_URL,
-        "Referer": BASE_URL + "/"
-    }
+# Finnhub tickers for stocks
+FINNHUB_STOCKS = {
+    "NVDA": "NVDA",
+    "TSLA": "TSLA",
+}
+
+# ─── STATE ────────────────────────────────────────────────────────────────────
+cooldown_until = {}
+price_cache    = {}
+CACHE_TTL      = 60
+
+
+# ─── HELPERS ──────────────────────────────────────────────────────────────────
 
 def tg(msg):
     try:
         requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            "https://api.telegram.org/bot{}/sendMessage".format(TELEGRAM_TOKEN),
             json={"chat_id": TELEGRAM_CHAT, "text": msg, "parse_mode": "HTML"},
             timeout=10
         )
     except Exception as e:
-        print(f"[TG] {e}")
+        print("[TG] {}".format(e))
+
+
+def api_headers():
+    return {
+        "Authorization": "Bearer {}".format(SESSION_TOKEN),
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Origin": BASE_URL,
+        "Referer": BASE_URL + "/",
+    }
+
+
+# ─── LIVE PRICE FEED ──────────────────────────────────────────────────────────
+
+def get_crypto_price(symbol):
+    cg_id = COINGECKO_MAP.get(symbol)
+    if not cg_id:
+        return None
+    try:
+        r = requests.get(
+            "https://api.coingecko.com/api/v3/simple/price"
+            "?ids={}&vs_currencies=usd&include_24hr_change=true".format(cg_id),
+            timeout=8
+        )
+        data = r.json().get(cg_id, {})
+        price = data.get("usd")
+        chg   = data.get("usd_24h_change", 0)
+        if price:
+            return {"price": price, "change_pct": round(chg, 2)}
+    except Exception as e:
+        print("[CG] {}: {}".format(symbol, e))
+    return None
+
+
+def get_stock_price(symbol):
+    ticker = FINNHUB_STOCKS.get(symbol)
+    if not ticker:
+        return None
+    try:
+        r = requests.get(
+            "https://finnhub.io/api/v1/quote?symbol={}&token={}".format(ticker, FINNHUB_KEY),
+            timeout=8
+        )
+        d = r.json()
+        if d.get("c") and d.get("pc"):
+            chg = round(((d["c"] - d["pc"]) / d["pc"]) * 100, 2)
+            return {"price": d["c"], "change_pct": chg}
+    except Exception as e:
+        print("[FH] {}: {}".format(symbol, e))
+    return None
+
+
+def get_live_price(symbol):
+    now = time.time()
+    cached = price_cache.get(symbol)
+    if cached and (now - cached.get("fetched_at", 0)) < CACHE_TTL:
+        return cached
+    data = None
+    if symbol in COINGECKO_MAP:
+        data = get_crypto_price(symbol)
+    elif symbol in FINNHUB_STOCKS:
+        data = get_stock_price(symbol)
+    if data:
+        data["fetched_at"] = now
+        price_cache[symbol] = data
+    return data
+
+
+def is_moving(symbol):
+    data = get_live_price(symbol)
+    if not data:
+        return False
+    return abs(data.get("change_pct", 0)) >= MIN_MOVE_PCT
+
+
+# ─── COOLDOWN ─────────────────────────────────────────────────────────────────
+
+def in_cooldown(symbol):
+    return time.time() < cooldown_until.get(symbol, 0)
+
+
+def set_cooldown(symbol):
+    cooldown_until[symbol] = time.time() + COOLDOWN_SECS
+    print("  [COOL] {} on cooldown for {} min".format(symbol, COOLDOWN_SECS // 60))
+
+
+# ─── API CALLS ────────────────────────────────────────────────────────────────
 
 def get_portfolio():
-    r = requests.get(f"{BASE_URL}/api/v1/portfolio/summary", headers=headers(), timeout=10)
+    r = requests.get("{}/api/v1/portfolio/summary".format(BASE_URL),
+                     headers=api_headers(), timeout=10)
     return r.json()
 
+
 def get_positions():
-    r = requests.get(f"{BASE_URL}/api/v1/trades", headers=headers(), timeout=10)
+    r = requests.get("{}/api/v1/trades".format(BASE_URL),
+                     headers=api_headers(), timeout=10)
     return [p for p in r.json().get("positions", []) if p.get("status") == "open"]
+
 
 def place_trade(symbol, side="buy"):
     r = requests.post(
-        f"{BASE_URL}/api/v1/trades",
-        headers=headers(),
+        "{}/api/v1/trades".format(BASE_URL),
+        headers=api_headers(),
         json={"symbol": symbol, "side": side, "amount": TRADE_AMOUNT},
         timeout=10
     )
     return r.json()
 
+
 def close_trade(trade_id):
-    r = requests.post(f"{BASE_URL}/api/v1/trades/{trade_id}/close", headers=headers(), timeout=10)
+    r = requests.post(
+        "{}/api/v1/trades/{}/close".format(BASE_URL, trade_id),
+        headers=api_headers(),
+        timeout=10
+    )
     return r.json()
 
-# ─── LOGIC ────────────────────────────────────────────────────────────────────
 
-def check_token_expiry():
-    """Warn on Telegram if token expires within TOKEN_WARN_SECS."""
-    now = int(datetime.now(timezone.utc).timestamp())
-    remaining = TOKEN_EXP_UTC - now
-    if remaining <= 0:
-        tg(
-            "🔴 <b>TOKEN EXPIRED — Bot halted</b>\n"
-            "Go to upsideonly.com → Cookie-Editor → export JSON → send to ZapiaPrime to redeploy."
-        )
-        print("[FATAL] Token expired. Exiting.")
-        raise SystemExit(1)
-    if remaining <= TOKEN_WARN_SECS:
-        mins = remaining // 60
-        tg(
-            f"⚠️ <b>Token expiring in {mins} min!</b>\n"
-            f"Go to upsideonly.com → Cookie-Editor → export JSON → send to ZapiaPrime.\n"
-            f"Bot keeps running until expiry."
-        )
-        print(f"[WARN] Token expires in {mins} min.")
+# ─── POSITION MANAGEMENT ──────────────────────────────────────────────────────
 
 def fill_positions():
-    """Open positions on any symbol not already held."""
-    positions  = get_positions()
-    open_syms  = {p["symbol"] for p in positions}
-    filled     = []
+    try:
+        positions = get_positions()
+    except Exception as e:
+        print("  [ERR] get_positions: {}".format(e))
+        return []
+
+    open_syms = {p["symbol"] for p in positions}
+    filled = []
+
     for sym in STRIKE_SYMBOLS:
-        if sym not in open_syms:
+        if sym in open_syms:
+            continue
+        if in_cooldown(sym):
+            mins_left = int((cooldown_until[sym] - time.time()) / 60)
+            print("  [SKIP] {} cooldown {}m".format(sym, mins_left))
+            continue
+        if not is_moving(sym):
+            print("  [SKIP] {} flat/no data".format(sym))
+            continue
+
+        data = get_live_price(sym)
+        chg_str = "{:+.2f}%".format(data["change_pct"]) if data else "?"
+
+        try:
             result = place_trade(sym, "buy")
-            if result.get("success") or result.get("trade_id"):
-                filled.append(sym)
-                print(f"  [OPEN] {sym} ${TRADE_AMOUNT:,}")
-            else:
-                print(f"  [SKIP] {sym} — {result.get('error','?')}")
-            time.sleep(0.3)
+        except Exception as e:
+            print("  [ERR] place {} : {}".format(sym, e))
+            continue
+
+        if result.get("success") or result.get("trade_id") or result.get("id"):
+            filled.append(sym)
+            print("  [OPEN] {} {} ${:,}".format(sym, chg_str, TRADE_AMOUNT))
+        else:
+            err = result.get("error", result.get("message", "api err"))
+            print("  [SKIP] {} - {}".format(sym, err))
+        time.sleep(0.5)
+
     return filled
 
-def monitor_and_cycle():
-    """Scan open positions; close winners and losers."""
-    wins, losses = [], []
-    for pos in get_positions():
-        pnl  = pos.get("unrealized_pnl_percent", 0)
-        sym  = pos["symbol"]
-        pid  = pos["id"]
+
+def monitor_positions():
+    wins, cuts = [], []
+    try:
+        positions = get_positions()
+    except Exception as e:
+        print("  [ERR] monitor: {}".format(e))
+        return wins, cuts
+
+    for pos in positions:
+        pnl = pos.get("unrealized_pnl_percent", 0)
+        sym = pos["symbol"]
+        pid = pos["id"]
+
         if pnl >= TAKE_PROFIT_PCT:
-            if close_trade(pid).get("success"):
-                wins.append((sym, pnl))
-                print(f"  [WIN ] {sym} closed at {pnl:+.2f}%")
+            try:
+                result = close_trade(pid)
+                if result.get("success") or result.get("id"):
+                    wins.append((sym, pnl))
+                    print("  [WIN ] {} +{:.2f}% TP hit".format(sym, pnl))
+            except Exception as e:
+                print("  [ERR] close win {}: {}".format(sym, e))
+
         elif pnl <= STOP_LOSS_PCT:
-            if close_trade(pid).get("success"):
-                losses.append((sym, pnl))
-                print(f"  [CUT ] {sym} closed at {pnl:+.2f}%")
-    return wins, losses
+            try:
+                result = close_trade(pid)
+                if result.get("success") or result.get("id"):
+                    cuts.append((sym, pnl))
+                    set_cooldown(sym)
+                    print("  [CUT ] {} {:.2f}% SL hit -> cooldown".format(sym, pnl))
+            except Exception as e:
+                print("  [ERR] close cut {}: {}".format(sym, e))
+
+    return wins, cuts
+
 
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 
-def run():
-    print(f"\n{'='*55}")
-    print(f"  UPSIDEONLY STRIKE BOT — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"  TP: +{TAKE_PROFIT_PCT}%  |  SL: {STOP_LOSS_PCT}%  |  ${TRADE_AMOUNT:,}/pos")
-    print(f"{'='*55}\n")
+def check_token():
+    now = int(datetime.now(timezone.utc).timestamp())
+    remaining = TOKEN_EXP_UTC - now
+    if remaining <= 0:
+        tg("TOKEN EXPIRED - Bot halted. Export cookies from upsideonly.com -> send to ZapiaPrime.")
+        raise SystemExit(1)
+    return remaining
 
-    check_token_expiry()
+
+def run():
+    print("=" * 55)
+    print("  UPSIDEONLY STRIKE BOT v2.0")
+    print("  {}".format(datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+    print("  TP: +{}%  SL: {}%  R/R: 2:1".format(TAKE_PROFIT_PCT, STOP_LOSS_PCT))
+    print("  Cooldown: {}m after cut".format(COOLDOWN_SECS // 60))
+    print("  Symbols: {}".format(", ".join(STRIKE_SYMBOLS)))
+    print("=" * 55)
+
+    remaining = check_token()
+    mins_left = remaining // 60
 
     port    = get_portfolio()
     balance = port.get("currentBalance", {}).get("value", 0)
     perf    = port.get("performancePercent", 0)
-
     exp_dt  = datetime.fromtimestamp(TOKEN_EXP_UTC).strftime("%Y-%m-%d %H:%M")
+
     tg(
-        f"<b>Strike Bot LIVE</b>\n"
-        f"Balance: ${balance:,.2f} | Perf: {perf:.2f}%\n"
-        f"TP: +{TAKE_PROFIT_PCT}% | SL: {STOP_LOSS_PCT}%\n"
-        f"Token expires: {exp_dt} ET\n"
-        f"Filling positions..."
+        "<b>Strike Bot v2.0 LIVE</b>\n"
+        "Balance: ${:,.2f} | Perf: {:.2f}%\n"
+        "TP: +{}% | SL: {}% | R/R: 2:1\n"
+        "Cooldown: {}m on cuts | Skip flat less than {}%\n"
+        "Token: {} min left ({} ET)\n"
+        "Filling positions with live prices...".format(
+            balance, perf,
+            TAKE_PROFIT_PCT, STOP_LOSS_PCT,
+            COOLDOWN_SECS // 60, MIN_MOVE_PCT,
+            mins_left, exp_dt
+        )
     )
 
-    print("[PHASE 1] Filling positions...")
+    print("\n[PHASE 1] Filling positions...")
     filled = fill_positions()
     if filled:
-        tg(f"Opened: {', '.join(filled)}")
+        tg("Opened: {}".format(", ".join(filled)))
+        print("  Opened: {}".format(filled))
+    else:
+        print("  No positions opened yet.")
 
-    cycle       = 0
-    total_wins  = 0
-    total_cuts  = 0
-    warned      = False
+    cycle      = 0
+    total_wins = 0
+    total_cuts = 0
+    warned     = False
 
-    print(f"\n[PHASE 2] Monitor loop — every {MONITOR_SECS}s\n")
+    print("\n[PHASE 2] Monitor loop every {}s\n".format(MONITOR_SECS))
 
     while True:
         cycle += 1
-        now = datetime.now().strftime("%H:%M:%S")
-        print(f"[{now}] Cycle {cycle}")
+        now_str = datetime.now().strftime("%H:%M:%S")
+        print("[{}] Cycle {}".format(now_str, cycle))
 
-        # Token expiry check — warn once, then every 10 cycles in danger zone
         remaining = TOKEN_EXP_UTC - int(datetime.now(timezone.utc).timestamp())
         if remaining <= 0:
-            tg("🔴 <b>Token EXPIRED — bot stopping.</b> Refresh token to resume.")
-            print("[FATAL] Token expired.")
+            tg("TOKEN EXPIRED - Bot stopping.")
             break
-        if remaining <= TOKEN_WARN_SECS and (not warned or cycle % 10 == 0):
-            mins = remaining // 60
-            tg(f"⚠️ <b>Token expiring in {mins} min!</b> Export cookies from upsideonly.com and send to ZapiaPrime.")
+        if remaining <= TOKEN_WARN_SECS and not warned:
+            tg("Token expiring in {} min! Export cookies -> send to ZapiaPrime.".format(remaining // 60))
             warned = True
 
-        # Monitor positions
-        wins, cuts = monitor_and_cycle()
+        wins, cuts = monitor_positions()
         total_wins += len(wins)
         total_cuts += len(cuts)
 
-        # Redeploy freed capital
         if wins or cuts:
             time.sleep(1)
-            print("  Redeploying...")
-            fill_positions()
+            new = fill_positions()
+            if new:
+                print("  Redeployed: {}".format(new))
 
-        # Periodic report
         if cycle % REPORT_EVERY == 0:
             try:
                 port    = get_portfolio()
@@ -199,21 +358,28 @@ def run():
                 perf    = port.get("performancePercent", 0)
                 pos     = get_positions()
                 lines   = "\n".join(
-                    f"  {p['symbol']:10} {p.get('unrealized_pnl_percent',0):+.2f}%"
+                    "  {:10} {:+.2f}%".format(p["symbol"], p.get("unrealized_pnl_percent", 0))
                     for p in pos
                 ) or "  (none)"
-                mins_left = remaining // 60
+                cds = [s for s in cooldown_until if in_cooldown(s)]
+                cd_str = "\nCooldowns: {}".format(", ".join(cds)) if cds else ""
+
                 tg(
-                    f"<b>Report — Cycle {cycle}</b>\n"
-                    f"Balance: ${balance:,.2f} | Perf: {perf:.2f}%\n"
-                    f"Wins: {total_wins} | Cuts: {total_cuts}\n"
-                    f"Token: {mins_left} min left\n"
-                    f"Positions:\n{lines}"
+                    "<b>Report - Cycle {}</b>\n"
+                    "Balance: ${:,.2f} | Perf: {:+.2f}%\n"
+                    "Wins: {} | Cuts: {}\n"
+                    "Token: {} min left\n"
+                    "Positions:\n{}{}".format(
+                        cycle, balance, perf,
+                        total_wins, total_cuts,
+                        remaining // 60, lines, cd_str
+                    )
                 )
             except Exception as e:
-                print(f"  [REPORT ERR] {e}")
+                print("  [REPORT ERR] {}".format(e))
 
         time.sleep(MONITOR_SECS)
+
 
 if __name__ == "__main__":
     run()
